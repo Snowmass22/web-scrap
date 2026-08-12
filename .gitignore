@@ -1,0 +1,18 @@
+# Output files & datasets
+output/
+output_data/
+scraped_data/
+*.csv
+*.xlsx
+*.html
+
+# Logs
+logs/
+*.log
+
+# Python cache & virtual environments
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

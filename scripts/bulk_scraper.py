@@ -27,16 +27,15 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 from scrape_doctor_profile import scrape_doctor_profile, DELAY_MIN, DELAY_MAX
 
+import argparse
+
 # ── Paths ──────────────────────────────────────────────────────────────────
-BASE_DIR        = Path(__file__).parent.parent
-INPUT_CSV       = BASE_DIR / "output" / "profile_urls_pune.csv"
-CHECKPOINT_CSV  = BASE_DIR / "output" / "practo_doctors_checkpoint.csv"
-FAILED_CSV      = BASE_DIR / "output" / "failed_urls.csv"
-LOG_DIR         = BASE_DIR / "logs"
+BASE_DIR = Path(__file__).parent.parent
+LOG_DIR  = BASE_DIR / "logs"
 
 # ── Config ─────────────────────────────────────────────────────────────────
 MAX_WORKERS      = 3      # Number of concurrent browser windows
-CHECKPOINT_EVERY = 100    # flush to CSV every N successful profiles
+CHECKPOINT_EVERY = 20     # flush to CSV every N successful profiles
 
 # ── Logging ────────────────────────────────────────────────────────────────
 LOG_DIR.mkdir(exist_ok=True)
@@ -53,11 +52,11 @@ log = logging.getLogger("bulk_scraper")
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def _load_already_scraped() -> set[str]:
+def _load_already_scraped(checkpoint_path: Path) -> set[str]:
     """Return the set of practo_profile_urls already present in the checkpoint file."""
-    if CHECKPOINT_CSV.exists():
+    if checkpoint_path.exists():
         try:
-            df = pd.read_csv(CHECKPOINT_CSV, usecols=["practo_profile_url"])
+            df = pd.read_csv(checkpoint_path, usecols=["practo_profile_url"])
             urls = set(df["practo_profile_url"].dropna().tolist())
             log.info(f"Resuming — {len(urls)} URLs already in checkpoint, skipping them.")
             return urls
@@ -66,35 +65,35 @@ def _load_already_scraped() -> set[str]:
     return set()
 
 
-def _load_already_failed() -> set[str]:
+def _load_already_failed(failed_path: Path) -> set[str]:
     """Return the set of URLs already recorded in failed_urls.csv."""
-    if FAILED_CSV.exists():
+    if failed_path.exists():
         try:
-            df = pd.read_csv(FAILED_CSV, usecols=["url"])
+            df = pd.read_csv(failed_path, usecols=["url"])
             return set(df["url"].dropna().tolist())
         except Exception:
             pass
     return set()
 
 
-def _save_checkpoint(records: list[dict]) -> None:
+def _save_checkpoint(records: list[dict], checkpoint_path: Path) -> None:
     """Append records to the checkpoint CSV, creating it with a header if needed."""
     df_new = pd.DataFrame(records)
-    if CHECKPOINT_CSV.exists():
-        df_new.to_csv(CHECKPOINT_CSV, mode="a", index=False, header=False)
+    if checkpoint_path.exists():
+        df_new.to_csv(checkpoint_path, mode="a", index=False, header=False)
     else:
-        df_new.to_csv(CHECKPOINT_CSV, mode="w", index=False, header=True)
-    log.info(f"  ✓ Checkpoint saved — {len(records)} new rows written to {CHECKPOINT_CSV.name}")
+        df_new.to_csv(checkpoint_path, mode="w", index=False, header=True)
+    log.info(f"  ✓ Checkpoint saved — {len(records)} new rows written to {checkpoint_path.name}")
 
 
-def _record_failure(url: str, reason: str) -> None:
-    """Append one row to failed_urls.csv."""
+def _record_failure(url: str, reason: str, failed_path: Path) -> None:
+    """Append one row to failed_urls CSV."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = pd.DataFrame([{"url": url, "reason": reason, "timestamp": ts}])
-    if FAILED_CSV.exists():
-        row.to_csv(FAILED_CSV, mode="a", index=False, header=False)
+    if failed_path.exists():
+        row.to_csv(failed_path, mode="a", index=False, header=False)
     else:
-        row.to_csv(FAILED_CSV, mode="w", index=False, header=True)
+        row.to_csv(failed_path, mode="w", index=False, header=True)
 
 
 def _is_failed_result(result: dict) -> bool:
@@ -105,17 +104,59 @@ def _is_failed_result(result: dict) -> bool:
 # ── Main loop ──────────────────────────────────────────────────────────────
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Bulk scrape Practo doctor profiles by location.")
+    parser.add_argument(
+        "-l", "--location",
+        type=str,
+        default="pune",
+        help="Target location keyword (e.g. pune, mumbai, delhi, margao, bangalore). Default: pune"
+    )
+    parser.add_argument(
+        "-i", "--input",
+        type=str,
+        default=None,
+        help="Path to input URLs CSV."
+    )
+    parser.add_argument(
+        "-c", "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint output CSV."
+    )
+    parser.add_argument(
+        "-f", "--failed",
+        type=str,
+        default=None,
+        help="Path to failed URLs CSV."
+    )
+
+    args = parser.parse_args()
+    loc = args.location.strip().lower()
+
+    input_csv = Path(args.input) if args.input else BASE_DIR / "output" / f"profile_urls_{loc}.csv"
+    if args.checkpoint:
+        checkpoint_csv = Path(args.checkpoint)
+    else:
+        checkpoint_csv = BASE_DIR / "output" / ("practo_doctors_checkpoint.csv" if loc == "pune" else f"practo_doctors_checkpoint_{loc}.csv")
+
+    if args.failed:
+        failed_csv = Path(args.failed)
+    else:
+        failed_csv = BASE_DIR / "output" / ("failed_urls.csv" if loc == "pune" else f"failed_urls_{loc}.csv")
+
+    log.info(f"Location: '{loc}' | Input: {input_csv.name} | Checkpoint: {checkpoint_csv.name}")
+
     # 1. Load input URLs
-    if not INPUT_CSV.exists():
-        log.error(f"Input file not found: {INPUT_CSV}")
+    if not input_csv.exists():
+        log.error(f"Input file not found: {input_csv}")
         sys.exit(1)
 
-    all_urls = pd.read_csv(INPUT_CSV)["url"].dropna().tolist()
+    all_urls = pd.read_csv(input_csv)["url"].dropna().tolist()
     log.info(f"Total URLs in input: {len(all_urls):,}")
 
     # 2. Determine resume state
-    done_urls   = _load_already_scraped()
-    failed_urls = _load_already_failed()
+    done_urls   = _load_already_scraped(checkpoint_csv)
+    failed_urls = _load_already_failed(failed_csv)
     skip_urls   = done_urls | failed_urls
 
     todo = [u for u in all_urls if u not in skip_urls]
@@ -146,69 +187,76 @@ def main() -> None:
             return target_url, None, e
 
     log.info(f"Starting ThreadPoolExecutor with {MAX_WORKERS} concurrent workers...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all tasks (memory overhead for 70k futures is negligible)
-        future_to_url = {executor.submit(_worker, u): u for u in todo}
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Submit all tasks (memory overhead for 70k futures is negligible)
+            future_to_url = {executor.submit(_worker, u): u for u in todo}
+            
+            for idx, future in enumerate(concurrent.futures.as_completed(future_to_url), start=1):
+                url = future_to_url[future]
+                try:
+                    url, result, exc = future.result()
+                except Exception as e:
+                    exc = e
+                    result = None
 
-        for idx, future in enumerate(concurrent.futures.as_completed(future_to_url), start=1):
-            url = future_to_url[future]
-            try:
-                url, result, exc = future.result()
-            except Exception as e:
-                exc = e
-                result = None
+                if exc:
+                    log.error(f"  Unhandled exception for {url}: {exc}")
+                    _record_failure(url, f"exception: {exc}", failed_csv)
+                    run_fail += 1
+                    fail_total += 1
+                    continue
 
-            if exc:
-                log.error(f"  Unhandled exception for {url}: {exc}")
-                _record_failure(url, f"exception: {exc}")
-                run_fail += 1
-                fail_total += 1
-                continue
+                if _is_failed_result(result):
+                    reason = "all fields None (blocked/404/empty)"
+                    log.warning(f"  → FAILED — {reason}")
+                    _record_failure(url, reason, failed_csv)
+                    run_fail += 1
+                    fail_total += 1
+                else:
+                    buffer.append(result)
+                    run_success += 1
+                    success_total += 1
 
-            if _is_failed_result(result):
-                reason = "all fields None (blocked/404/empty)"
-                log.warning(f"  → FAILED — {reason}")
-                _record_failure(url, reason)
-                run_fail += 1
-                fail_total += 1
-            else:
-                buffer.append(result)
-                run_success += 1
-                success_total += 1
+                # 4. Checkpoint every N successful profiles
+                if len(buffer) >= CHECKPOINT_EVERY:
+                    _save_checkpoint(buffer, checkpoint_csv)
+                    buffer = []
 
-            # 4. Checkpoint every N successful profiles
-            if len(buffer) >= CHECKPOINT_EVERY:
-                _save_checkpoint(buffer)
-                buffer = []
+                # 5. Live progress summary
+                elapsed = time.time() - start_time
+                rate = idx / elapsed if elapsed > 0 else 0
+                remaining = (len(todo) - idx) / rate if rate > 0 else 0
+                log.info(
+                    f"  Progress: {idx}/{len(todo)} | "
+                    f"✓ {run_success} scraped | ✗ {run_fail} failed | "
+                    f"{rate:.2f} req/s | ETA ~{remaining/60:.0f}m"
+                )
 
-            # 5. Live progress summary
-            elapsed = time.time() - start_time
-            rate = idx / elapsed if elapsed > 0 else 0
-            remaining = (len(todo) - idx) / rate if rate > 0 else 0
-            log.info(
-                f"  Progress: {idx}/{len(todo)} | "
-                f"✓ {run_success} scraped | ✗ {run_fail} failed | "
-                f"{rate:.2f} req/s | ETA ~{remaining/60:.0f}m"
-            )
+    except KeyboardInterrupt:
+        log.warning("\nExecution interrupted by user (Ctrl+C). Flushing remaining data...")
 
-    # 7. Final flush for any remaining buffered results
-    if buffer:
-        _save_checkpoint(buffer)
+    finally:
+        # 7. Final flush for any remaining buffered results
+        if buffer:
+            log.info(f"Flushing {len(buffer)} profiles from buffer before exiting...")
+            _save_checkpoint(buffer, checkpoint_csv)
 
-    # 8. Final summary
-    elapsed = time.time() - start_time
-    log.info("=" * 65)
-    log.info("SCRAPE COMPLETE")
-    log.info(f"  Total URLs processed this run : {idx:,}")
-    log.info(f"  Successfully scraped          : {run_success:,}")
-    log.info(f"  Failed / blocked              : {run_fail:,}")
-    log.info(f"  Total in checkpoint file      : {success_total:,}")
-    log.info(f"  Total in failed_urls file     : {fail_total:,}")
-    log.info(f"  Time elapsed                  : {elapsed/60:.1f} minutes")
-    log.info(f"  Output                        : {CHECKPOINT_CSV}")
-    log.info(f"  Failed URLs                   : {FAILED_CSV}")
-    log.info("=" * 65)
+        # 8. Final summary
+        elapsed = time.time() - start_time
+        log.info("=" * 65)
+        log.info("SCRAPE COMPLETE / STOPPED")
+        log.info(f"  Total URLs processed this run : {idx:,}")
+        log.info(f"  Successfully scraped          : {run_success:,}")
+        log.info(f"  Failed / blocked              : {run_fail:,}")
+        log.info(f"  Total in checkpoint file      : {success_total:,}")
+        log.info(f"  Total in failed_urls file     : {fail_total:,}")
+        log.info(f"  Time elapsed                  : {elapsed/60:.1f} minutes")
+        log.info(f"  Output                        : {checkpoint_csv}")
+        log.info(f"  Failed URLs                   : {failed_csv}")
+        log.info("=" * 65)
 
 
 if __name__ == "__main__":
     main()
+

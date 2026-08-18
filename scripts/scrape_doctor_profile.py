@@ -204,6 +204,37 @@ def _extract_registration(soup: BeautifulSoup) -> str | None:
         return None
 
 
+def _extract_clinic_address(soup: BeautifulSoup) -> str | None:
+    try:
+        clinics = []
+        # Strategy 1: Look for data-qa-id containing "address"
+        address_nodes = soup.find_all(attrs={"data-qa-id": lambda x: x and "address" in str(x).lower()})
+        for node in address_nodes:
+            clinics.append(node.get_text(" ", strip=True))
+            
+        # Strategy 2: Look for specific clinic blocks if Strategy 1 yields nothing
+        if not clinics:
+            clinic_items = soup.find_all("div", class_="c-profile--clinic--item")
+            for item in clinic_items:
+                text = item.get_text(" ", strip=True)
+                text = re.sub(r"Get Directions.*", "", text).strip()
+                text = re.sub(r"Call Clinic.*", "", text).strip()
+                if text:
+                    clinics.append(text)
+                    
+        if clinics:
+            seen = set()
+            unique_clinics = []
+            for c in clinics:
+                if c and c not in seen:
+                    seen.add(c)
+                    unique_clinics.append(c)
+            return " | ".join(unique_clinics)
+    except Exception:
+        pass
+    return None
+
+
 def _load_ld_json(soup: BeautifulSoup) -> dict:
     """Return the first Physician JSON-LD block, or empty dict."""
     for tag in soup.find_all("script", type="application/ld+json"):
@@ -220,6 +251,54 @@ def _load_ld_json(soup: BeautifulSoup) -> dict:
     return {}
 
 
+# ── Specialization Canonical Mapping ─────────────────────────────────────────
+CANONICAL_MAP = {
+    "Gynecologist": "Gynecologist", "Gynaecologist": "Gynecologist", "Obstetrician": "Gynecologist",
+    "Obstetrician and Gynecologist": "Gynecologist", "Gynecologist/Obstetrician": "Gynecologist", "OB-GYN": "Gynecologist",
+    "Dermatologist": "Dermatologist", "Skin Specialist": "Dermatologist", "Cosmetologist": "Dermatologist",
+    "Aesthetic Dermatologist": "Dermatologist",
+    "General Physician": "General Physician", "GP": "General Physician", "Internal Medicine Specialist": "General Physician",
+    "Internal Medicine": "General Physician", "General Medicine": "General Physician", "General Practitioner": "General Physician",
+    "Dentist": "Dentist", "Dental Surgeon": "Dentist", "Endodontist": "Dentist", "Orthodontist": "Dentist",
+    "Pediatric Dentist": "Dentist", "Periodontist": "Dentist", "Restorative Dentist": "Dentist", "Implantologist": "Dentist",
+    "Orthodontist & Dentofacial Orthopedist": "Dentist",
+    "Pediatrician": "Pediatrician", "Orthopedic surgeon": "Orthopedist", "Orthopedist": "Orthopedist",
+    "Joint Replacement Surgeon": "Orthopedist", "Psychiatrist": "Psychiatrist", "Psychologist": "Psychologist",
+    "Clinical Psychologist": "Psychologist", "Counselling Psychologist": "Psychologist",
+    "Rehabilitation Psychologist": "Psychologist", "Health Psychologist": "Psychologist",
+    "Cardiologist": "Cardiologist", "Neurologist": "Neurologist", "Physiotherapist": "Physiotherapist",
+    "Clinical Physiotherapist": "Physiotherapist", "Neuro Physiotherapist": "Physiotherapist",
+    "Geriatric Physiotherapist": "Physiotherapist", "Infertility Specialist": "Infertility Specialist",
+    "Pulmonologist": "Pulmonologist", "Homoeopath": "Homoeopath",
+}
+
+def _parse_name_parts(full_name: str | None) -> tuple[str, str]:
+    if not full_name or not full_name.strip():
+        return "", ""
+    prefixes = r"^(Dr\.|Dr|Mr\.|Mr|Ms\.|Ms|Mrs\.|Mrs|Prof\.|Prof|Dr\. med\.)\s+"
+    name = re.sub(r"\(.*?\)$", "", full_name).strip()
+    name = re.sub(prefixes, "", name, flags=re.IGNORECASE).strip()
+    name = re.sub(r"\s+", " ", name).strip()
+    tokens = name.split(" ")
+    if len(tokens) == 1:
+        return tokens[0], ""
+    elif len(tokens) >= 2:
+        return tokens[0], tokens[-1]
+    return "", ""
+
+def _build_specialization_alias(raw_spec: str | None) -> str:
+    if not raw_spec or not raw_spec.strip():
+        return ""
+    parts = raw_spec.split(",")
+    cleaned_parts = []
+    for part in parts:
+        part = re.sub(r"\(Unverified\).*$", "", part).strip()
+        if not part: continue
+        mapped = CANONICAL_MAP.get(part, part)
+        if mapped not in cleaned_parts:
+            cleaned_parts.append(mapped)
+    return ", ".join(cleaned_parts)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,19 +307,23 @@ def scrape_doctor_profile(url: str) -> dict:
     Scrape a Practo doctor profile page and return a structured dict.
 
     Returns a dict with keys:
-        full_name, specialization, qualification, experience,
-        location, registration, profile_url
+        full_name, first_name, last_name, specialization, specialization_alias,
+        qualification, experience, location, registration_details, address_of_clinic, practo_profile_url
 
     Missing fields return None instead of raising.
     """
     log.info(f"Scraping: {url}")
     result = {
         "full_name":             None,
+        "first_name":            None,
+        "last_name":             None,
         "specialization":        None,
+        "specialization_alias":  None,
         "qualification":         None,
         "experience":            None,
         "location":              None,
         "registration_details":  None,
+        "address_of_clinic":     None,
         "practo_profile_url":    url,
     }
 
@@ -276,6 +359,12 @@ def scrape_doctor_profile(url: str) -> dict:
     result["experience"]           = _extract_experience(soup, ld)
     result["location"]             = _extract_location(url)
     result["registration_details"] = _extract_registration(soup)
+    result["address_of_clinic"]    = _extract_clinic_address(soup)
+    
+    first, last = _parse_name_parts(result["full_name"])
+    result["first_name"] = first
+    result["last_name"] = last
+    result["specialization_alias"] = _build_specialization_alias(result["specialization"])
 
     log.info(f"  → {result['full_name']} | {result['specialization']} | {result['experience']}")
     _log_request(

@@ -23,10 +23,21 @@ Rules enforced:
 """
 
 import sys
+import os
 import logging
 from pathlib import Path
 
+# Fix Unicode output on Windows consoles (cp1252 → utf-8)
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 import pandas as pd
+from dotenv import load_dotenv
+
+# Load .env for Neon DB credentials
+load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).parent.parent
@@ -38,9 +49,13 @@ LOG_DIR        = BASE_DIR / "logs"
 # ── Exact final column order ───────────────────────────────────────────────
 FINAL_COLUMNS = [
     "full_name",
+    "first_name",
+    "last_name",
     "specialization",
+    "specialization_alias",
     "qualification",
     "experience",
+    "address_of_clinic",
     "location",
     "registration_details",
     "practo_profile_url",
@@ -109,18 +124,18 @@ def _null_report(df: pd.DataFrame) -> None:
     """Print a clear per-column completeness report."""
     total = len(df)
     print()
-    print("─" * 68)
+    print("-" * 68)
     print(f"  DATA COMPLETENESS REPORT  (total rows: {total:,})")
-    print("─" * 68)
+    print("-" * 68)
     print(f"  {'#':<3}  {'Column':<25}  {'Empty':>7}  {'%':>7}  {'Filled':>8}")
     print("  " + "-" * 62)
     for i, col in enumerate(FINAL_COLUMNS, 1):
         empty  = int((df[col] == "").sum())
         filled = total - empty
         pct    = (empty / total * 100) if total > 0 else 0.0
-        flag   = "  ⚠" if pct > 20 else ""
+        flag   = "  !" if pct > 20 else ""
         print(f"  {i:<3}  {col:<25}  {empty:>7,}  {pct:>6.1f}%  {filled:>8,}{flag}")
-    print("─" * 68)
+    print("-" * 68)
     print()
 
 
@@ -178,16 +193,62 @@ def _export_xlsx(df: pd.DataFrame, path: Path) -> None:
         log.info(f"  XLSX written (plain) → {path}")
 
 
+import argparse
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Clean and export Practo doctor data by location.")
+    parser.add_argument(
+        "-l", "--location",
+        type=str,
+        default="pune",
+        help="Target location keyword (e.g. pune, mumbai, delhi, margao). Default: pune"
+    )
+    parser.add_argument(
+        "-i", "--input",
+        type=str,
+        default=None,
+        help="Path to checkpoint CSV."
+    )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default=None,
+        help="Output CSV path."
+    )
+    parser.add_argument(
+        "--xlsx",
+        type=str,
+        default=None,
+        help="Output XLSX path."
+    )
+
+    args = parser.parse_args()
+    loc = args.location.strip().lower()
+
+    if args.input:
+        checkpoint_csv = Path(args.input)
+    else:
+        checkpoint_csv = BASE_DIR / "output" / ("practo_doctors_checkpoint.csv" if loc == "pune" else f"practo_doctors_checkpoint_{loc}.csv")
+
+    if args.csv:
+        final_csv = Path(args.csv)
+    else:
+        final_csv = BASE_DIR / "output" / ("practo_doctors_final.csv" if loc == "pune" else f"practo_doctors_final_{loc}.csv")
+
+    if args.xlsx:
+        final_xlsx = Path(args.xlsx)
+    else:
+        final_xlsx = BASE_DIR / "output" / ("practo_doctors_final.xlsx" if loc == "pune" else f"practo_doctors_final_{loc}.xlsx")
+
     # 1. Load checkpoint
-    if not CHECKPOINT_CSV.exists():
-        log.error(f"Checkpoint file not found: {CHECKPOINT_CSV}")
+    if not checkpoint_csv.exists():
+        log.error(f"Checkpoint file not found: {checkpoint_csv}")
         sys.exit(1)
 
-    log.info(f"Loading: {CHECKPOINT_CSV}")
-    df = pd.read_csv(CHECKPOINT_CSV, dtype=str)
+    log.info(f"Loading: {checkpoint_csv}")
+    df = pd.read_csv(checkpoint_csv, dtype=str)
     log.info(f"  Raw rows loaded: {len(df):,}  |  Columns: {list(df.columns)}")
 
     # 2. Handle legacy column names
@@ -219,19 +280,42 @@ def main() -> None:
     _null_report(df)
 
     # 8. Export CSV
-    df.to_csv(FINAL_CSV, index=False, encoding="utf-8-sig")  # utf-8-sig for Excel compat
-    log.info(f"  CSV written  → {FINAL_CSV}")
+    df.to_csv(final_csv, index=False, encoding="utf-8-sig")  # utf-8-sig for Excel compat
+    log.info(f"  CSV written  → {final_csv}")
 
     # 9. Export XLSX
-    _export_xlsx(df, FINAL_XLSX)
+    _export_xlsx(df, final_xlsx)
 
-    # 10. Final summary
+    # 10. Upload to Neon DB (if configured)
+    db_url = os.getenv("NEON_DATABASE_URL", "")
+    if db_url and "your_user" not in db_url:
+        log.info("NEON_DATABASE_URL found — uploading to Neon DB...")
+        try:
+            # Import here to avoid hard dependency when Neon is not used
+            from neon_upload import _connect, _upload
+            conn = _connect()
+            try:
+                uploaded = _upload(df, loc, conn)
+                log.info(f"  ✓ Neon DB upload complete — {uploaded:,} rows upserted.")
+            except Exception as e:
+                conn.rollback()
+                log.error(f"  Neon DB upload failed: {e}")
+            finally:
+                conn.close()
+        except ImportError:
+            log.warning("  psycopg2 not installed. Run: pip install psycopg2-binary")
+    else:
+        log.info("  Neon DB upload skipped (NEON_DATABASE_URL not configured in .env).")
+
+    # 11. Final summary
     print("=" * 68)
     print("EXPORT COMPLETE")
     print(f"  Total rows in final dataset : {len(df):,}")
     print(f"  Duplicates removed          : {dupes:,}")
-    print(f"  Output CSV                  : {FINAL_CSV}")
-    print(f"  Output XLSX                 : {FINAL_XLSX}")
+    print(f"  Output CSV                  : {final_csv}")
+    print(f"  Output XLSX                 : {final_xlsx}")
+    if db_url and "your_user" not in db_url:
+        print(f"  Neon DB table              : practo_doctors (tag='{loc}')")
     print("=" * 68)
 
 

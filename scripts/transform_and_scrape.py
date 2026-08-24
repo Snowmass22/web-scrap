@@ -208,16 +208,28 @@ def scrape_address(page, url: str) -> str:
         return ""
 
 def batch_scrape_addresses(df: pd.DataFrame, limit: int = None, output_path: str = None) -> pd.DataFrame:
-    urls_to_scrape = df[df['address_of_clinic'].isna() | (df['address_of_clinic'] == "")]['practo_profile_url'].dropna().unique()
+    tracker_file = None
+    done_urls = set()
+    
+    if output_path:
+        tracker_file = Path(output_path).parent / f".scraped_urls_{Path(output_path).stem}.txt"
+        if tracker_file.exists():
+            with open(tracker_file, "r", encoding="utf-8") as f:
+                done_urls = {line.strip() for line in f if line.strip()}
+            log.info(f"Loaded {len(done_urls):,} already-processed URLs from tracker.")
+
+    # Only scrape URLs that haven't been visited yet
+    all_urls = df['practo_profile_url'].dropna().unique()
+    urls_to_scrape = [u for u in all_urls if u not in done_urls]
     
     if limit:
         urls_to_scrape = urls_to_scrape[:limit]
         
     if len(urls_to_scrape) == 0:
-        log.info("No URLs need scraping.")
+        log.info("No URLs need scraping (all already processed).")
         return df
 
-    log.info(f"Going to scrape {len(urls_to_scrape)} URLs for addresses...")
+    log.info(f"Going to scrape {len(urls_to_scrape)} remaining URLs for addresses (skipping {len(done_urls):,} already done)...")
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False, args=["--disable-blink-features=AutomationControlled"])
@@ -242,7 +254,14 @@ def batch_scrape_addresses(df: pd.DataFrame, limit: int = None, output_path: str
             else:
                 log.info(f"  -> Address: {address[:60]}...")
             
-            df.loc[df['practo_profile_url'] == url, 'address_of_clinic'] = address
+            if address:
+                df.loc[df['practo_profile_url'] == url, 'address_of_clinic'] = address
+                
+            done_urls.add(url)
+            if tracker_file:
+                with open(tracker_file, "a", encoding="utf-8") as tf:
+                    tf.write(f"{url}\n")
+                    
             ctx.close()
             
             # Incremental save every 20 records

@@ -248,7 +248,11 @@ def main() -> None:
         sys.exit(1)
 
     log.info(f"Loading: {checkpoint_csv}")
-    df = pd.read_csv(checkpoint_csv, dtype=str)
+    try:
+        df = pd.read_csv(checkpoint_csv, dtype=str)
+    except Exception as e:
+        log.warning(f"Default CSV parser encountered an issue ({e}). Retrying with on_bad_lines='skip'...")
+        df = pd.read_csv(checkpoint_csv, dtype=str, on_bad_lines="skip")
     log.info(f"  Raw rows loaded: {len(df):,}  |  Columns: {list(df.columns)}")
 
     # 2. Handle legacy column names
